@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-command installer for pc-shell MCP server (Linux).
-# Sets up a venv, generates a token, and installs a systemd service that
-# auto-starts on boot and auto-restarts on crash.
+# Creates a venv, scaffolds .env (with generated secrets), and installs a systemd
+# service that auto-starts on boot and auto-restarts on crash.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,43 +28,62 @@ python3 -m venv "$APP_DIR/.venv"
 say "Installing dependencies"
 "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt"
 
-# --- 3. token / .env -------------------------------------------------------- #
+# --- 3. .env scaffold ------------------------------------------------------- #
 if [ ! -f "$APP_DIR/.env" ]; then
   TOKEN="$(openssl rand -hex 32)"
-  echo "MCP_TOKEN=$TOKEN" > "$APP_DIR/.env"
+  JWT_KEY="$("$APP_DIR/.venv/bin/python" -c 'import secrets; print(secrets.token_urlsafe(48))')"
+  cat > "$APP_DIR/.env" <<ENV
+# Fill in the GitHub OAuth values, your allow-list, and the real MCP_BASE_URL,
+# then start the service. See .env.example for all options.
+GH_CLIENT_ID=
+GH_CLIENT_SECRET=
+ALLOWED_GITHUB_USERS=
+MCP_BASE_URL=https://CHANGE-ME.example.ts.net
+MCP_JWT_SIGNING_KEY=$JWT_KEY
+MCP_TOKEN=$TOKEN
+ENV
   chmod 600 "$APP_DIR/.env"
-  say "Generated a new MCP_TOKEN and wrote $APP_DIR/.env"
+  say "Wrote $APP_DIR/.env with a generated MCP_TOKEN and MCP_JWT_SIGNING_KEY"
 else
-  say ".env already exists - keeping your existing MCP_TOKEN"
+  say ".env already exists - leaving it untouched"
 fi
-TOKEN_VALUE="$(grep -E '^MCP_TOKEN=' "$APP_DIR/.env" | head -n1 | cut -d= -f2-)"
 
 # --- 4. systemd service ----------------------------------------------------- #
 if command -v systemctl >/dev/null 2>&1; then
-  say "Installing systemd service (needs sudo)"
+  say "Installing systemd unit (needs sudo)"
   UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
   sed -e "s|__USER__|$USER|g" \
       -e "s|__APP_DIR__|$APP_DIR|g" \
       -e "s|__HOME__|$HOME|g" \
       "$APP_DIR/pc-shell.service" | sudo tee "$UNIT" >/dev/null
   sudo systemctl daemon-reload
-  sudo systemctl enable --now "$SERVICE_NAME"
-  say "Service '$SERVICE_NAME' is enabled and running."
-  say "Logs:   journalctl -u $SERVICE_NAME -f"
-  say "Status: systemctl status $SERVICE_NAME"
+  sudo systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+  say "Service enabled to start on boot."
 else
-  err "systemctl not found; skipping service install. Run manually:"
+  err "systemctl not found; skipping service install. Run manually after editing .env:"
   echo "  $APP_DIR/.venv/bin/python $APP_DIR/server.py"
 fi
 
-# --- 5. next steps ---------------------------------------------------------- #
+# --- 5. readiness check + next steps --------------------------------------- #
+missing=""
+for k in GH_CLIENT_ID GH_CLIENT_SECRET ALLOWED_GITHUB_USERS; do
+  v="$(grep -E "^$k=" "$APP_DIR/.env" | head -n1 | cut -d= -f2-)"
+  [ -z "$v" ] && missing="$missing $k"
+done
+
 cat <<EOF
 
 ------------------------------------------------------------
-pc-shell MCP server is set up.
+pc-shell MCP server is installed.
 
   Local endpoint : http://127.0.0.1:8000/mcp
-  Bearer token   : $TOKEN_VALUE
+
+Before starting, create a GitHub OAuth App:
+  GitHub > Settings > Developer settings > OAuth Apps > New OAuth App
+    Homepage URL:               <your MCP_BASE_URL>
+    Authorization callback URL: <your MCP_BASE_URL>/auth/callback
+  Then put the Client ID / secret, your GitHub username(s), and the
+  real MCP_BASE_URL into: $APP_DIR/.env
 
 Expose it with a FREE, persistent public URL (Tailscale Funnel):
   1. Install Tailscale + log in:   https://tailscale.com/download
@@ -74,7 +93,15 @@ Expose it with a FREE, persistent public URL (Tailscale Funnel):
        tailscale funnel --bg 8000
   4. Your public MCP endpoint is:
        https://<machine>.<tailnet>.ts.net/mcp
-
-Then add it in your MCP client with the bearer token above.
-------------------------------------------------------------
 EOF
+
+if [ -n "$missing" ]; then
+  echo
+  err "Not started yet - fill these in $APP_DIR/.env first:$missing"
+  echo "Then run:  sudo systemctl start $SERVICE_NAME"
+else
+  say "Starting service"
+  sudo systemctl restart "$SERVICE_NAME"
+  say "Running. Logs: journalctl -u $SERVICE_NAME -f"
+fi
+echo "------------------------------------------------------------"

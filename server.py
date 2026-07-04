@@ -1,20 +1,21 @@
 """
-pc-shell MCP server (Linux) - hardened build.
+pc-shell MCP server (Linux) - MultiAuth build (OAuth GitHub + static token).
 
-Exposes a Linux shell to an MCP client (e.g. Notion) over Streamable HTTP.
-Improvements over the original 20-line server:
-  * Persistent session: working directory and exported env vars survive across
-    calls (fixes the "cd/export forgotten every call" flaw).
-  * Partial output on timeout (no more losing everything a command printed).
-  * Head+tail output truncation with an explicit marker (no silently dropping
-    the top of a build log).
-  * Structured audit logging of every invocation.
-  * Optional command allow-list.
-  * Binds 127.0.0.1 by default (the tunnel only needs loopback).
+Exposes a Linux shell to MCP clients (ChatGPT, Notion, Claude) over Streamable
+HTTP, protected by real OAuth 2.1 + PKCE via FastMCP's GitHub OAuth provider.
 
-API grounded in current FastMCP docs (gofastmcp.com): FastMCP, @mcp.tool,
-mcp.run(transport="http", host, port, path); StaticTokenVerifier import path
-verified against fastmcp 3.4.x.
+Why OAuth instead of a static ?token=:
+  * No secret token in the URL / server logs / browser history.
+  * Standard browser login flow that ChatGPT and Notion understand natively
+    (FastMCP presents a DCR/CIMD-compliant face and proxies to ONE pre-
+    registered GitHub OAuth app).
+  * Access restricted to an explicit allow-list of GitHub usernames.
+
+Persistence (survives restarts, no re-login needed):
+  * jwt_signing_key (stable, from env) keeps issued tokens valid across restarts.
+  * client_storage (FileTreeStore on disk) keeps registered OAuth clients.
+
+API grounded in installed FastMCP 3.4.2 (signature introspected on host).
 """
 
 import json
@@ -30,15 +31,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastmcp import FastMCP
+from fastmcp.server.auth import MultiAuth
+from fastmcp.server.auth.providers.github import GitHubProvider
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+from fastmcp.server.dependencies import get_access_token
+from key_value.aio.stores.filetree import FileTreeStore
 
 # --------------------------------------------------------------------------- #
 # Configuration (all via environment; see .env.example)
 # --------------------------------------------------------------------------- #
-TOKEN = os.environ.get("MCP_TOKEN")
-if not TOKEN:
-    raise SystemExit("Set MCP_TOKEN (generate one with: openssl rand -hex 32)")
-
 HOST = os.environ.get("MCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MCP_PORT", "8000"))
 MOUNT_PATH = os.environ.get("MCP_PATH", "/mcp")
@@ -49,8 +50,39 @@ LOG_FILE = os.path.expanduser(
     os.environ.get("MCP_LOG_FILE", str(Path.home() / ".pc-shell" / "audit.log"))
 )
 
+# OAuth (GitHub) configuration
+GH_CLIENT_ID = os.environ.get("GH_CLIENT_ID")
+GH_CLIENT_SECRET = os.environ.get("GH_CLIENT_SECRET")
+BASE_URL = os.environ.get("MCP_BASE_URL", "http://localhost:8000")
+JWT_SIGNING_KEY = os.environ.get("MCP_JWT_SIGNING_KEY")
+OAUTH_STORE_DIR = os.path.expanduser(
+    os.environ.get("MCP_OAUTH_STORE_DIR", str(Path.home() / ".pc-shell" / "oauth"))
+)
+ALLOWED_USERS = {
+    u.strip().lower()
+    for u in os.environ.get("ALLOWED_GITHUB_USERS", "").split(",")
+    if u.strip()
+}
+
+# Static owner token: machine / fallback access (e.g. the Notion connection).
+# Optional -- if MCP_TOKEN is unset, only OAuth is enabled.
+STATIC_TOKEN = os.environ.get("MCP_TOKEN")
+
+if not GH_CLIENT_ID or not GH_CLIENT_SECRET:
+    raise SystemExit(
+        "Set GH_CLIENT_ID and GH_CLIENT_SECRET (from your GitHub OAuth App)."
+    )
+if not JWT_SIGNING_KEY:
+    raise SystemExit(
+        "Set MCP_JWT_SIGNING_KEY (python -c 'import secrets; print(secrets.token_urlsafe(48))')"
+    )
+if not ALLOWED_USERS:
+    raise SystemExit(
+        "Set ALLOWED_GITHUB_USERS to your GitHub username(s), comma-separated."
+    )
+
 # --------------------------------------------------------------------------- #
-# Audit logging (server-side; docs recommend stdlib logging for file output)
+# Audit logging
 # --------------------------------------------------------------------------- #
 Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
 logger = logging.getLogger("pc-shell")
@@ -69,6 +101,34 @@ def _audit(event: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Authorization guard: only allow-listed GitHub users may call tools
+# --------------------------------------------------------------------------- #
+def _require_authorized_user():
+    try:
+        token = get_access_token()
+    except Exception:
+        token = None
+    if token is None:
+        _audit({"event": "denied", "reason": "no_token"})
+        raise PermissionError("Not authorized: no valid credentials.")
+
+    # Path 1: static owner token (machine / fallback access, e.g. Notion).
+    if getattr(token, "client_id", None) == "owner":
+        return "owner"
+
+    # Path 2: OAuth (GitHub) -- must be an allow-listed GitHub account.
+    claims = getattr(token, "claims", None) or {}
+    login = (claims.get("login") or claims.get("preferred_username") or "").lower()
+    if login and login in ALLOWED_USERS:
+        return login
+
+    _audit({"event": "denied", "login": login, "claim_keys": list(claims.keys())})
+    raise PermissionError(
+        "Not authorized: your GitHub account is not on this server's allow-list."
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Persistent session state (cwd + exported environment)
 # --------------------------------------------------------------------------- #
 _lock = threading.Lock()
@@ -76,7 +136,8 @@ _lock = threading.Lock()
 
 def _initial_env() -> dict:
     env = dict(os.environ)
-    env.pop("MCP_TOKEN", None)  # never expose the server token to child commands
+    for secret in ("GH_CLIENT_SECRET", "GH_CLIENT_ID", "MCP_JWT_SIGNING_KEY", "MCP_TOKEN"):
+        env.pop(secret, None)  # never expose server secrets to child commands
     return env
 
 
@@ -101,52 +162,35 @@ def _truncate(text: str, limit: int):
 
 
 # --------------------------------------------------------------------------- #
-# Server
+# Server (OAuth via GitHub; persistent token + client storage)
 # --------------------------------------------------------------------------- #
-from starlette.middleware import Middleware
-from starlette.middleware.authentication import AuthenticationMiddleware
-from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
-from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend, AuthenticatedUser
-from starlette.requests import HTTPConnection
-from starlette.authentication import AuthCredentials
-
-class QueryParamBearerAuthBackend(BearerAuthBackend):
-    async def authenticate(self, conn: HTTPConnection):
-        auth_header = next(
-            (conn.headers.get(key) for key in conn.headers if key.lower() == "authorization"),
-            None,
-        )
-        token = None
-        if auth_header and auth_header.lower().startswith("bearer "):
-            token = auth_header[7:]
-        else:
-            token = conn.query_params.get("token")
-
-        if not token:
-            return None
-
-        auth_info = await self.token_verifier.verify_token(token)
-        if not auth_info:
-            return None
-
-        if auth_info.expires_at and auth_info.expires_at < int(time.time()):
-            return None
-
-        return AuthCredentials(auth_info.scopes), AuthenticatedUser(auth_info)
-
-class CustomStaticTokenVerifier(StaticTokenVerifier):
-    def get_middleware(self) -> list:
-        return [
-            Middleware(
-                AuthenticationMiddleware,
-                backend=QueryParamBearerAuthBackend(self),
-            ),
-            Middleware(AuthContextMiddleware),
-        ]
-
-auth = CustomStaticTokenVerifier(
-    tokens={TOKEN: {"client_id": "owner", "scopes": ["use"]}}
+oauth_provider = GitHubProvider(
+    client_id=GH_CLIENT_ID,
+    client_secret=GH_CLIENT_SECRET,
+    base_url=BASE_URL,
+    redirect_path="/auth/callback",
+    jwt_signing_key=JWT_SIGNING_KEY,
+    client_storage=FileTreeStore(data_directory=OAUTH_STORE_DIR),
+    require_authorization_consent="remember",
 )
+
+# MultiAuth: OAuth (interactive clients: ChatGPT / Notion / Claude) AND an
+# optional static bearer token (machine / fallback access) on ONE endpoint.
+# The OAuth provider owns all OAuth routes + metadata; StaticTokenVerifier only
+# adds a second token-verification path. Requests are verified against the OAuth
+# provider first, then the static token.
+_verifiers = []
+if STATIC_TOKEN:
+    # Match the OAuth provider's required scopes so the static token passes the
+    # transport-level scope check (MultiAuth inherits required_scopes from the
+    # server). Real authorization is still enforced by _require_authorized_user.
+    _owner_scopes = list(oauth_provider.required_scopes or []) or ["use"]
+    _verifiers.append(
+        StaticTokenVerifier(
+            tokens={STATIC_TOKEN: {"client_id": "owner", "scopes": _owner_scopes}}
+        )
+    )
+auth = MultiAuth(server=oauth_provider, verifiers=_verifiers)
 mcp = FastMCP("pc-shell", auth=auth)
 
 
@@ -160,6 +204,7 @@ def run_command(command: str, timeout: int = DEFAULT_TIMEOUT) -> dict:
     Returns: exit_code, stdout, stderr, cwd, duration_ms, timed_out,
     stdout_truncated, stderr_truncated.
     """
+    _require_authorized_user()
     if ALLOWLIST:
         try:
             first = (shlex.split(command) or [""])[0]
@@ -222,7 +267,6 @@ def run_command(command: str, timeout: int = DEFAULT_TIMEOUT) -> dict:
                 err = (err + f"\n[timed out after {timeout}s; partial output above]").strip()
             duration = int((time.monotonic() - start) * 1000)
 
-            # Persist new cwd / exported env for the next call.
             try:
                 if os.path.exists(cwd_f):
                     new_cwd = Path(cwd_f).read_text().strip()
@@ -237,7 +281,8 @@ def run_command(command: str, timeout: int = DEFAULT_TIMEOUT) -> dict:
                         k, _, v = pair.partition(b"=")
                         new_env[k.decode(errors="replace")] = v.decode(errors="replace")
                     if new_env:
-                        new_env.pop("MCP_TOKEN", None)
+                        for secret in ("GH_CLIENT_SECRET", "GH_CLIENT_ID", "MCP_JWT_SIGNING_KEY", "MCP_TOKEN"):
+                            new_env.pop(secret, None)
                         _session["env"] = new_env
             except Exception:
                 pass
@@ -269,6 +314,7 @@ def run_command(command: str, timeout: int = DEFAULT_TIMEOUT) -> dict:
 @mcp.tool
 def reset_session() -> dict:
     """Reset the persistent shell session (cwd and environment) to defaults."""
+    _require_authorized_user()
     with _lock:
         _session["cwd"] = os.environ.get("HOME", os.getcwd())
         _session["env"] = _initial_env()
@@ -279,6 +325,7 @@ def reset_session() -> dict:
 @mcp.tool
 def get_system_info() -> dict:
     """Return host OS/platform details and current session working directory."""
+    _require_authorized_user()
     return {
         "platform": platform.system(),
         "release": platform.release(),
@@ -291,5 +338,36 @@ def get_system_info() -> dict:
     }
 
 
+# --------------------------------------------------------------------------- #
+# ASGI shim: accept the static owner token via ?token= (query string) in
+# addition to the standard Authorization: Bearer header. Preserves backward
+# compatibility with the existing Notion connection so it survives the switch
+# to MultiAuth without reconnecting. OAuth flows are unaffected (they always
+# use the Authorization header).
+# --------------------------------------------------------------------------- #
+class QueryTokenToHeaderMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            headers = scope.get("headers") or []
+            has_auth = any(k == b"authorization" for k, _ in headers)
+            if not has_auth:
+                from urllib.parse import parse_qs
+                qs = scope.get("query_string", b"").decode("latin-1")
+                tok = parse_qs(qs).get("token", [None])[0]
+                if tok:
+                    scope = dict(scope)
+                    scope["headers"] = list(headers) + [
+                        (b"authorization", ("Bearer " + tok).encode("latin-1"))
+                    ]
+        await self.app(scope, receive, send)
+
+
 if __name__ == "__main__":
-    mcp.run(transport="http", host=HOST, port=PORT, path=MOUNT_PATH)
+    import uvicorn
+
+    app = mcp.http_app(path=MOUNT_PATH)
+    app = QueryTokenToHeaderMiddleware(app)
+    uvicorn.run(app, host=HOST, port=PORT)
