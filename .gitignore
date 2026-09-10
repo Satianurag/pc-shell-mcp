@@ -1,10 +1,4 @@
 .venv/
-__pycache__/
-*.pyc
 .env
-.env.backup
-# local server variants / operational backups (not part of the published build)
-server_oauth.py
-server_multiauth.py
-server_token_backup.py
-server_prev_before_multiauth.py
+__pycache__/
+*.py[cod]
