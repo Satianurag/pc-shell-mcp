@@ -22,7 +22,7 @@ cd pc-shell-mcp
 ./install.sh
 ```
 
-On the first run, `.env` is created. Fill these values:
+On the first run, `.env` is created. Fill these values and rerun `./install.sh`:
 
 ```dotenv
 GH_CLIENT_ID=...
@@ -31,12 +31,37 @@ ALLOWED_GITHUB_USERS=Satianurag
 MCP_BASE_URL=https://<machine>.<tailnet>.ts.net
 ```
 
-`MCP_JWT_SIGNING_KEY` and `MCP_STORAGE_KEY` are generated automatically. Rerun `./install.sh` after editing `.env`; it installs and starts the correct native service for the OS.
+`MCP_JWT_SIGNING_KEY` and `MCP_STORAGE_KEY` are generated automatically.
 
 GitHub OAuth App settings:
 
 - Homepage URL: `MCP_BASE_URL`
 - Authorization callback URL: `MCP_BASE_URL/auth/callback`
+
+## macOS
+
+The source checkout can live in `Documents`, but macOS protects that folder from unattended background processes. The installer therefore deploys a self-contained runtime to:
+
+```text
+~/Library/Application Support/pc-shell-mcp
+```
+
+The LaunchAgent `com.satianurag.pc-shell-mcp` runs only from that runtime. This avoids requiring Full Disk Access merely to start the MCP server. Rerun `./install.sh` after changing the source or `.env`; it synchronizes the runtime and restarts the agent.
+
+```bash
+launchctl print "gui/$(id -u)/com.satianurag.pc-shell-mcp"
+tail -f ~/Library/Logs/pc-shell-mcp.err.log
+```
+
+The installer captures the interactive `PATH` so shell commands can find Homebrew and user-installed CLI tools. macOS privacy controls can still restrict remote commands that themselves access protected folders such as Documents or Desktop; grant only the access you actually need.
+
+## Linux
+
+```bash
+sudo systemctl status pc-shell
+sudo systemctl restart pc-shell
+journalctl -u pc-shell -f
+```
 
 ## Stable public endpoint
 
@@ -54,51 +79,16 @@ https://<machine>.<tailnet>.ts.net/mcp
 
 Keep `MCP_BASE_URL` as the origin only (`https://<machine>.<tailnet>.ts.net`), without `/mcp`.
 
-## Service management
-
-### macOS
-
-The installer creates a per-user LaunchAgent named `com.satianurag.pc-shell-mcp` in `~/Library/LaunchAgents`.
-
-```bash
-launchctl print "gui/$(id -u)/com.satianurag.pc-shell-mcp"
-tail -f ~/Library/Logs/pc-shell-mcp.err.log
-```
-
-To restart after changing `.env`, simply rerun:
-
-```bash
-./install.sh
-```
-
-### Linux
-
-```bash
-sudo systemctl status pc-shell
-sudo systemctl restart pc-shell
-journalctl -u pc-shell -f
-```
-
 ## Verify before adding to ChatGPT
-
-Local endpoint (an unauthenticated `401` is expected when OAuth is healthy):
 
 ```bash
 curl -i http://127.0.0.1:8000/mcp
-```
-
-Public endpoint should no longer return `502`:
-
-```bash
 curl -i "${MCP_BASE_URL}/mcp"
-```
-
-OAuth discovery:
-
-```bash
 curl -i "${MCP_BASE_URL}/.well-known/oauth-protected-resource/mcp"
 curl -i "${MCP_BASE_URL}/.well-known/oauth-authorization-server"
 ```
+
+An unauthenticated `401` from `/mcp` is expected when OAuth is healthy; the public endpoint should not return `502`.
 
 ## Configuration
 

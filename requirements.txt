@@ -1,3 +1,4 @@
 fastmcp==4.0.3
 py-key-value-aio[wrappers-encryption]==0.4.5
 cryptography==50.0.1
+python-dotenv==1.2.3
