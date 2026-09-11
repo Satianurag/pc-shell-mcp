@@ -1,4 +1,4 @@
-"""Minimal, authenticated Linux shell MCP server."""
+"""Minimal, authenticated local shell MCP server."""
 
 import asyncio
 import os
@@ -8,6 +8,7 @@ from contextlib import suppress
 from pathlib import Path
 
 from cryptography.fernet import Fernet
+from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.server.auth import AuthContext
 from fastmcp.server.auth.providers.github import GitHubProvider
@@ -18,6 +19,9 @@ from key_value.aio.stores.filetree import (
     FileTreeV1KeySanitizationStrategy,
 )
 from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+
+# Load a colocated .env when present. Real environment variables keep precedence.
+load_dotenv(Path(__file__).with_name(".env"))
 
 HOST = os.environ.get("MCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MCP_PORT", "8000"))
