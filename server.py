@@ -28,7 +28,7 @@ PORT = int(os.environ.get("MCP_PORT", "8000"))
 BASE_URL = os.environ["MCP_BASE_URL"].rstrip("/")
 DEFAULT_TIMEOUT = int(os.environ.get("MCP_DEFAULT_TIMEOUT", "60"))
 MAX_TIMEOUT = int(os.environ.get("MCP_MAX_TIMEOUT", "600"))
-MAX_OUTPUT = int(os.environ.get("MCP_MAX_OUTPUT", "65536"))
+MAX_OUTPUT = int(os.environ.get("MCP_MAX_OUTPUT", "0"))
 MAX_CONCURRENT = int(os.environ.get("MCP_MAX_CONCURRENT", "4"))
 OAUTH_DIR = Path(os.environ.get("MCP_OAUTH_DIR", "~/.pc-shell/oauth")).expanduser()
 ALLOWED_USERS = {
@@ -41,8 +41,8 @@ if not ALLOWED_USERS:
     raise SystemExit("ALLOWED_GITHUB_USERS must contain at least one GitHub username")
 if DEFAULT_TIMEOUT < 1 or MAX_TIMEOUT < DEFAULT_TIMEOUT:
     raise SystemExit("Require 1 <= MCP_DEFAULT_TIMEOUT <= MCP_MAX_TIMEOUT")
-if MAX_OUTPUT < 1024 or MAX_CONCURRENT < 1:
-    raise SystemExit("MCP_MAX_OUTPUT must be >= 1024 and MCP_MAX_CONCURRENT >= 1")
+if MAX_OUTPUT < 0 or MAX_CONCURRENT < 1:
+    raise SystemExit("MCP_MAX_OUTPUT must be >= 0 (0 = unlimited) and MCP_MAX_CONCURRENT >= 1")
 
 OAUTH_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 OAUTH_DIR.chmod(0o700)
@@ -88,7 +88,11 @@ def _child_env() -> dict[str, str]:
 
 
 async def _capture(stream: asyncio.StreamReader, limit: int) -> tuple[str, bool]:
-    """Drain a stream with bounded memory, retaining the head and tail."""
+    """Drain a stream. When limit is 0, capture the full stream without truncation."""
+    if limit == 0:
+        data = await stream.read()
+        return data.decode(errors="replace"), False
+
     head_limit = (limit * 2) // 3
     tail_limit = limit - head_limit
     head, tail = bytearray(), bytearray()
@@ -127,13 +131,59 @@ async def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
     await proc.wait()
 
 
+def _format_command_result(
+    *,
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+    cwd: str,
+    duration_ms: int,
+    timed_out: bool,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+) -> str:
+    """Return plain text that MCP clients can read directly."""
+    lines = [
+        f"exit_code: {exit_code}",
+        f"cwd: {cwd}",
+        f"duration_ms: {duration_ms}",
+    ]
+    if timed_out:
+        lines.append("timed_out: true")
+    if stdout_truncated:
+        lines.append("stdout_truncated: true")
+    if stderr_truncated:
+        lines.append("stderr_truncated: true")
+    lines.extend(
+        [
+            "",
+            "--- stdout ---",
+            stdout.rstrip("\n") if stdout else "(empty)",
+            "",
+            "--- stderr ---",
+            stderr.rstrip("\n") if stderr else "(empty)",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _shell_command() -> tuple[str, list[str]]:
+    """Use the user's login shell so PATH, aliases, and tool configs load."""
+    shell = os.environ.get("SHELL", "/bin/zsh")
+    shell_name = Path(shell).name
+    if shell_name in {"zsh", "bash", "sh", "ksh"}:
+        return shell, ["-lc"]
+    return "/bin/sh", ["-c"]
+
+
 @mcp.tool
-async def run_command(command: str, cwd: str | None = None, timeout: int = DEFAULT_TIMEOUT) -> dict:
-    """Run a non-interactive bash command as the service user.
+async def run_command(command: str, cwd: str | None = None, timeout: int = DEFAULT_TIMEOUT) -> str:
+    """Run a non-interactive shell command as the service user.
 
     Calls are intentionally stateless. Pass ``cwd`` explicitly when a command must
     run in a particular directory. ``timeout`` must be between 1 and
-    MCP_MAX_TIMEOUT seconds. Output is memory-bounded and keeps its head and tail.
+    MCP_MAX_TIMEOUT seconds. When MCP_MAX_OUTPUT is 0 (default), stdout and stderr are
+    returned in full without server-side truncation.
     """
     if not command.strip():
         raise ValueError("command must not be empty")
@@ -146,10 +196,11 @@ async def run_command(command: str, cwd: str | None = None, timeout: int = DEFAU
 
     started = time.monotonic()
     timed_out = False
+    shell, shell_args = _shell_command()
     async with _slots:
         proc = await asyncio.create_subprocess_exec(
-            "bash",
-            "-c",
+            shell,
+            *shell_args,
             command,
             cwd=str(workdir),
             env=_child_env(),
@@ -171,16 +222,16 @@ async def run_command(command: str, cwd: str | None = None, timeout: int = DEFAU
     if timed_out:
         stderr = (stderr + f"\n[timed out after {timeout}s]").lstrip("\n")
 
-    return {
-        "exit_code": -1 if timed_out else proc.returncode,
-        "stdout": stdout,
-        "stderr": stderr,
-        "cwd": str(workdir),
-        "duration_ms": int((time.monotonic() - started) * 1000),
-        "timed_out": timed_out,
-        "stdout_truncated": stdout_truncated,
-        "stderr_truncated": stderr_truncated,
-    }
+    return _format_command_result(
+        exit_code=-1 if timed_out else proc.returncode,
+        stdout=stdout,
+        stderr=stderr,
+        cwd=str(workdir),
+        duration_ms=int((time.monotonic() - started) * 1000),
+        timed_out=timed_out,
+        stdout_truncated=stdout_truncated,
+        stderr_truncated=stderr_truncated,
+    )
 
 
 if __name__ == "__main__":

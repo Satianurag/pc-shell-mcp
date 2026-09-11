@@ -94,7 +94,7 @@ An unauthenticated `401` from `/mcp` is expected when OAuth is healthy; the publ
 
 Required: `GH_CLIENT_ID`, `GH_CLIENT_SECRET`, `ALLOWED_GITHUB_USERS`, `MCP_BASE_URL`, `MCP_JWT_SIGNING_KEY`, `MCP_STORAGE_KEY`.
 
-Optional limits: `MCP_HOST=127.0.0.1`, `MCP_PORT=8000`, `MCP_DEFAULT_TIMEOUT=60`, `MCP_MAX_TIMEOUT=600`, `MCP_MAX_OUTPUT=65536`, `MCP_MAX_CONCURRENT=4`, `MCP_OAUTH_DIR=~/.pc-shell/oauth`.
+Optional limits: `MCP_HOST=127.0.0.1`, `MCP_PORT=8000`, `MCP_DEFAULT_TIMEOUT=60`, `MCP_MAX_TIMEOUT=600`, `MCP_MAX_OUTPUT=0` (0 = unlimited), `MCP_MAX_CONCURRENT=4`, `MCP_OAUTH_DIR=~/.pc-shell/oauth`.
 
 ## Update
 
